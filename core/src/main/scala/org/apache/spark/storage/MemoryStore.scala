@@ -24,11 +24,19 @@ import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.util.{SizeEstimator, Utils}
 
-private case class MemoryEntry(value: Any, size: Long, deserialized: Boolean)
+private case class MemoryEntry(value: Any, size: Long, deserialized: Boolean, var dropping: Boolean = false)
 
 /**
  * Stores blocks in memory, either as ArrayBuffers of deserialized Java objects or as
  * serialized ByteBuffers.
+ *
+ * When one thread is trying to add a block, first it will select blocks to be dropped
+ * and mark them as dropping(the selection will skip blocks marked as dropping). The
+ * selection and marking are done within a select lock which ensures each thread will select
+ * different to-be-dropped blocks. Then the thread will do the dropping without any lock and
+ * remove them from memory store after dropping finished. If exception happens, it will
+ * reset the dropping flag of its to-be-dropped blocks so that other thread can re-select
+ * and re-drop them.
  */
 private class MemoryStore(blockManager: BlockManager, maxMemory: Long)
   extends BlockStore(blockManager) {
@@ -37,7 +45,7 @@ private class MemoryStore(blockManager: BlockManager, maxMemory: Long)
   @volatile private var currentMemory = 0L
   // Object used to ensure that only one thread is putting blocks and if necessary, dropping
   // blocks from the memory store.
-  private val putLock = new Object()
+  private val selectLock = new Object()
 
   logInfo("MemoryStore started with capacity %s".format(Utils.bytesToString(maxMemory)))
 
@@ -152,11 +160,6 @@ private class MemoryStore(blockManager: BlockManager, maxMemory: Long)
    * an ArrayBuffer if deserialized is true or a ByteBuffer otherwise. Its (possibly estimated)
    * size must also be passed by the caller.
    *
-   * Lock on the object putLock to ensure that all the put requests and its associated block
-   * dropping is done by only on thread at a time. Otherwise while one thread is dropping
-   * blocks to free memory for one block, another thread may use up the freed space for
-   * another block.
-   *
    * Return whether put was successful, along with the blocks dropped in the process.
    */
   private def tryToPut(
@@ -165,64 +168,69 @@ private class MemoryStore(blockManager: BlockManager, maxMemory: Long)
       size: Long,
       deserialized: Boolean): ResultWithDroppedBlocks = {
 
-    /* TODO: Its possible to optimize the locking by locking entries only when selecting blocks
-     * to be dropped. Once the to-be-dropped blocks have been selected, and lock on entries has
-     * been released, it must be ensured that those to-be-dropped blocks are not double counted
-     * for freeing up more space for another block that needs to be put. Only then the actually
-     * dropping of blocks (and writing to disk if necessary) can proceed in parallel. */
-
     var putSuccess = false
     val droppedBlocks = new ArrayBuffer[(BlockId, BlockStatus)]
-
-    putLock.synchronized {
-      val freeSpaceResult = ensureFreeSpace(blockId, size)
-      val enoughFreeSpace = freeSpaceResult.success
-      droppedBlocks ++= freeSpaceResult.droppedBlocks
-
-      if (enoughFreeSpace) {
-        val entry = new MemoryEntry(value, size, deserialized)
-        entries.synchronized {
-          entries.put(blockId, entry)
-          currentMemory += size
+    val result = findToBeDroppedBlocks(blockId, size)
+    if (result.isDefined) {
+      val toBeDroppedBlocks = result.get
+      var droppingDoneCount = 0
+      try {
+        toBeDroppedBlocks.foreach { block =>
+          val droppedBlockStatus = blockManager.dropFromMemory(block.id, block.data)
+          droppedBlockStatus.foreach { status => droppedBlocks += blockId -> status }
+          droppingDoneCount += 1
         }
-        val valuesOrBytes = if (deserialized) "values" else "bytes"
-        logInfo("Block %s stored as %s in memory (estimated size %s, free %s)".format(
-          blockId, valuesOrBytes, Utils.bytesToString(size), Utils.bytesToString(freeMemory)))
-        putSuccess = true
-      } else {
-        // Tell the block manager that we couldn't put it in memory so that it can drop it to
-        // disk if the block allows disk storage.
-        val data = if (deserialized) {
-          Left(value.asInstanceOf[ArrayBuffer[Any]])
-        } else {
-          Right(value.asInstanceOf[ByteBuffer].duplicate())
+      } finally {
+        if (droppingDoneCount < toBeDroppedBlocks.size) {
+          toBeDroppedBlocks.drop(droppingDoneCount).foreach { block =>
+            entries.synchronized{
+              val entry = entries.get(block.id)
+              if (entry != null) entry.dropping = false
+            }
+          }
         }
-        val droppedBlockStatus = blockManager.dropFromMemory(blockId, data)
-        droppedBlockStatus.foreach { status => droppedBlocks += ((blockId, status)) }
       }
+
+      val entry = new MemoryEntry(value, size, deserialized)
+      entries.synchronized {
+        entries.put(blockId, entry)
+        currentMemory += size
+      }
+      val valuesOrBytes = if (deserialized) "values" else "bytes"
+      logInfo("Block %s stored as %s in memory (estimated size %s, free %s)".format(
+        blockId, valuesOrBytes, Utils.bytesToString(size), Utils.bytesToString(freeMemory)))
+      putSuccess = true
+    } else {
+      // Tell the block manager that we couldn't put it in memory so that it can drop it to
+      // disk if the block allows disk storage.
+      val data = if (deserialized) {
+        Left(value.asInstanceOf[ArrayBuffer[Any]])
+      } else {
+        Right(value.asInstanceOf[ByteBuffer].duplicate())
+      }
+      val droppedBlockStatus = blockManager.dropFromMemory(blockId, data)
+      droppedBlockStatus.foreach { status => droppedBlocks += blockId -> status }
     }
     ResultWithDroppedBlocks(putSuccess, droppedBlocks)
   }
 
   /**
-   * Try to free up a given amount of space to store a particular block, but can fail if
-   * either the block is bigger than our memory or it would require replacing another block
-   * from the same RDD (which leads to a wasteful cyclic replacement pattern for RDDs that
-   * don't fit into memory that we want to avoid).
+   * Try to select some blocks which will free up a given amount of space to store a
+   * particular block, but can fail if either the block is bigger than our memory or
+   * it would require selecting another block from the same RDD (which leads to a wasteful
+   * cyclic replacement pattern for RDDs that don't fit into memory that we want to avoid).
    *
-   * Assume that a lock is held by the caller to ensure only one thread is dropping blocks.
-   * Otherwise, the freed space may fill up before the caller puts in their new value.
-   *
-   * Return whether there is enough free space, along with the blocks dropped in the process.
+   * Return None if there is no enough free space, or Some[List[ToBeDroppedBlock]] if space is
+   * enough and tell the caller which blocks need to be dropped
    */
-  private def ensureFreeSpace(blockIdToAdd: BlockId, space: Long): ResultWithDroppedBlocks = {
+  private def findToBeDroppedBlocks(blockIdToAdd: BlockId, space: Long): Option[Seq[ToBeDroppedBlock]] = {
     logInfo(s"ensureFreeSpace($space) called with curMem=$currentMemory, maxMem=$maxMemory")
 
-    val droppedBlocks = new ArrayBuffer[(BlockId, BlockStatus)]
+    val toBeDroppedBlocks = new ArrayBuffer[ToBeDroppedBlock]
 
     if (space > maxMemory) {
       logInfo(s"Will not store $blockIdToAdd as it is larger than our memory limit")
-      return ResultWithDroppedBlocks(success = false, droppedBlocks)
+      return None
     }
 
     if (maxMemory - currentMemory < space) {
@@ -230,17 +238,27 @@ private class MemoryStore(blockManager: BlockManager, maxMemory: Long)
       val selectedBlocks = new ArrayBuffer[BlockId]()
       var selectedMemory = 0L
 
-      // This is synchronized to ensure that the set of entries is not changed
-      // (because of getValue or getBytes) while traversing the iterator, as that
-      // can lead to exceptions.
-      entries.synchronized {
-        val iterator = entries.entrySet().iterator()
-        while (maxMemory - (currentMemory - selectedMemory) < space && iterator.hasNext) {
-          val pair = iterator.next()
-          val blockId = pair.getKey
-          if (rddToAdd.isEmpty || rddToAdd != getRddId(blockId)) {
-            selectedBlocks += blockId
-            selectedMemory += pair.getValue.size
+      // This lock ensures that the selection and marking for the to-be-dropped blocks
+      // is done by only one thread at a time. Otherwise if one thread has selected some
+      // blocks and going to mark them as dropping, another thread may select the same blocks
+      // and mark them twice, which leads to incorrect calculation of free space.
+      selectLock.synchronized {
+
+        // This is synchronized to ensure that the set of entries is not changed
+        // (because of getValue or getBytes) while traversing the iterator, as that
+        // can lead to exceptions.
+        entries.synchronized {
+          val iterator = entries.entrySet().iterator()
+          while (maxMemory - (currentMemory - selectedMemory) < space && iterator.hasNext) {
+            val pair = iterator.next()
+            val entry = pair.getValue
+            if (!entry.dropping) {
+              val blockId = pair.getKey
+              if (rddToAdd.isEmpty || rddToAdd != getRddId(blockId)) {
+                selectedBlocks += blockId
+                selectedMemory += entry.size
+              }
+            }
           }
         }
       }
@@ -248,34 +266,38 @@ private class MemoryStore(blockManager: BlockManager, maxMemory: Long)
       if (maxMemory - (currentMemory - selectedMemory) >= space) {
         logInfo(s"${selectedBlocks.size} blocks selected for dropping")
         for (blockId <- selectedBlocks) {
-          val entry = entries.synchronized { entries.get(blockId) }
-          // This should never be null as only one thread should be dropping
-          // blocks and removing entries. However the check is still here for
-          // future safety.
-          if (entry != null) {
-            val data = if (entry.deserialized) {
-              Left(entry.value.asInstanceOf[ArrayBuffer[Any]])
-            } else {
-              Right(entry.value.asInstanceOf[ByteBuffer].duplicate())
+          entries.synchronized {
+            val entry = entries.get(blockId)
+
+            // Currently we only remove block when drop it from memory, and each thread
+            // will select different blocks to drop,so it won't happen that a selected
+            // block has been removed. However the check is still here for future safety.
+            if (entry != null) {
+              val data = if (entry.deserialized) {
+                Left(entry.value.asInstanceOf[ArrayBuffer[Any]])
+              } else {
+                Right(entry.value.asInstanceOf[ByteBuffer].duplicate())
+              }
+              toBeDroppedBlocks += ToBeDroppedBlock(blockId, data)
+              entry.dropping = true
             }
-            val droppedBlockStatus = blockManager.dropFromMemory(blockId, data)
-            droppedBlockStatus.foreach { status => droppedBlocks += ((blockId, status)) }
           }
         }
-        return ResultWithDroppedBlocks(success = true, droppedBlocks)
       } else {
         logInfo(s"Will not store $blockIdToAdd as it would require dropping another block " +
           "from the same RDD")
-        return ResultWithDroppedBlocks(success = false, droppedBlocks)
+        return None
       }
     }
-    ResultWithDroppedBlocks(success = true, droppedBlocks)
+    Some(toBeDroppedBlocks)
   }
 
   override def contains(blockId: BlockId): Boolean = {
     entries.synchronized { entries.containsKey(blockId) }
   }
 }
+
+private case class ToBeDroppedBlock(id: BlockId, data: Either[ArrayBuffer[Any], ByteBuffer])
 
 private case class ResultWithDroppedBlocks(
     success: Boolean,
