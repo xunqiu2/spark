@@ -101,3 +101,41 @@ case class GetField(child: Expression, fieldName: String) extends UnaryExpressio
 
   override def toString = s"$child.$fieldName"
 }
+
+case class GetFieldFromArrayType(child: Expression, fieldName: String) extends UnaryExpression {
+  override type EvaluatedType = Any
+
+  def dataType = ArrayType(field.dataType, arrayType.containsNull)
+  override def nullable: Boolean = child.nullable || field.nullable
+  override def foldable = child.foldable
+
+  lazy val arrayType = child.dataType match {
+    case a: ArrayType => a
+    case otherType => sys.error(s"GetFieldFromArrayOfStruct is not valid on fields of type $otherType")
+  }
+
+  protected def elementStructType = arrayType.elementType match {
+      case s: StructType => s
+      case otherType => sys.error(s"GetFieldFromArrayOfStruct is not valid on array of type $otherType")
+  }
+
+  lazy val field =
+    elementStructType.fields
+      .find(_.name == fieldName)
+      .getOrElse(sys.error(s"No such field $fieldName in ${child.dataType}"))
+
+  lazy val ordinal = elementStructType.fields.indexOf(field)
+
+  override lazy val resolved = childrenResolved && child.dataType.isInstanceOf[ArrayType]
+
+  override def eval(input: Row): Any = {
+    val values = child.eval(input).asInstanceOf[Seq[Row]]
+    values.map{ r =>
+      if (r == null) {
+        null
+      } else {
+        r(ordinal)
+      }
+    }
+  }
+}

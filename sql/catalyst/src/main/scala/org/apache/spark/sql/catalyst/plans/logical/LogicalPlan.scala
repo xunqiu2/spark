@@ -20,7 +20,7 @@ package org.apache.spark.sql.catalyst.plans.logical
 import org.apache.spark.sql.catalyst.errors.TreeNodeException
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.QueryPlan
-import org.apache.spark.sql.catalyst.types.StructType
+import org.apache.spark.sql.catalyst.types.{ArrayType, StructType}
 import org.apache.spark.sql.catalyst.trees
 
 abstract class LogicalPlan extends QueryPlan[LogicalPlan] {
@@ -106,8 +106,14 @@ abstract class LogicalPlan extends QueryPlan[LogicalPlan] {
       // One match, but we also need to extract the requested nested field.
       case Seq((a, nestedFields)) =>
         a.dataType match {
-          case StructType(fields) =>
-            Some(Alias(nestedFields.foldLeft(a: Expression)(GetField), nestedFields.last)())
+          case _: StructType | _: ArrayType =>
+            Some(Alias(nestedFields.foldLeft(a: Expression){(e, s) =>
+              e.dataType match {
+                case _: StructType => GetField(e, s)
+                case _: ArrayType => GetFieldFromArrayType(e, s)
+                case otherType => sys.error(s"can not handle nested field with type $otherType")
+              }
+            }, nestedFields.last)())
           case _ => None // Don't know how to resolve these field references
         }
       case Seq() => None         // No matches.

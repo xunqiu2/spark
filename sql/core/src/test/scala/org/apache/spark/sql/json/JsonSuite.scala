@@ -312,6 +312,15 @@ class JsonSuite extends QueryTest {
     )
   }
 
+  test("Complex field of array type") {
+    val jsonSchemaRDD = jsonRDD(complexFieldArrayType)
+    jsonSchemaRDD.registerTempTable("jsonTable")
+    checkAnswer(
+      sql("SELECT a.b.c.d, a.b.e from jsonTable"),
+      (Seq("value1", null, "value2", null), Seq(null, "valueE", null, null)) :: Nil
+    )
+  }
+
   test("Type conflict in primitive field values") {
     val jsonSchemaRDD = jsonRDD(primitiveFieldValueTypeConflict)
 
