@@ -365,7 +365,7 @@ class SqlParser extends StandardTokenParsers with PackratParsers {
       case base ~ _ ~ ordinal => GetItem(base, ordinal)
     } |
     (expression <~ ".") ~ ident ^^ {
-      case base ~ fieldName => GetField(base, fieldName)
+      case base ~ fieldName => UnresolvedGetField(base, fieldName)
     } |
     TRUE ^^^ Literal(true, BooleanType) |
     FALSE ^^^ Literal(false, BooleanType) |

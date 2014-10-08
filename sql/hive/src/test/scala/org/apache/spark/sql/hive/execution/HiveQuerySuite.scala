@@ -675,6 +675,16 @@ class HiveQuerySuite extends HiveComparisonTest {
     sql("SELECT * FROM boom").queryExecution.analyzed
   }
 
+  case class NestedData(a: Seq[NestedData2], B: NestedData2)
+  case class NestedData2(a: NestedData3, B: NestedData3)
+  case class NestedData3(a: Int, B: Int)
+
+  test("case insensitive test for nested data") {
+    sparkContext.makeRDD(Seq.empty[NestedData]).registerTempTable("nested")
+    // This should be successfully analyzed
+    sql("SELECT a[0].A.A from nested").queryExecution.analyzed
+  }
+
   test("parse HQL set commands") {
     // Adapted from its SQL counterpart.
     val testKey = "spark.sql.key.usedfortestonly"
