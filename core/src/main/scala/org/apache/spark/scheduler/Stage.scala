@@ -47,43 +47,57 @@ import org.apache.spark.util.CallSite
  * be updated for each attempt.
  *
  */
-private[spark] class Stage(
-    val id: Int,
-    val rdd: RDD[_],
-    val numTasks: Int,
-    val shuffleDep: Option[ShuffleDependency[_, _, _]],  // Output shuffle if stage is a map stage
-    val parents: List[Stage],
-    val jobId: Int,
-    val callSite: CallSite)
-  extends Logging {
 
-  val isShuffleMap = shuffleDep.isDefined
+
+private[spark] trait Stage extends Logging {
+  def id: Int
+  def rdd: RDD[_]
+  def numTasks: Int
+  def jobId: Int
+  def jobSet: collection.Set[Int]
+  def callSite: CallSite
+
   val numPartitions = rdd.partitions.size
-  val outputLocs = Array.fill[List[MapStatus]](numPartitions)(Nil)
-  var numAvailableOutputs = 0
-
-  /** Set of jobs that this stage belongs to. */
-  val jobIds = new HashSet[Int]
-
-  /** For stages that are the final (consists of only ResultTasks), link to the ActiveJob. */
-  var resultOfJob: Option[ActiveJob] = None
-  var pendingTasks = new HashSet[Task[_]]
-
   private var nextAttemptId = 0
-
+  var pendingTasks = new HashSet[Task[_]]
   val name = callSite.shortForm
   val details = callSite.longForm
-
   /** Pointer to the latest [StageInfo] object, set by DAGScheduler. */
   var latestInfo: StageInfo = StageInfo.fromStage(this)
 
-  def isAvailable: Boolean = {
-    if (!isShuffleMap) {
-      true
-    } else {
-      numAvailableOutputs == numPartitions
-    }
+  /** Return a new attempt id, starting with 0. */
+  def newAttemptId(): Int = {
+    val id = nextAttemptId
+    nextAttemptId += 1
+    id
   }
+
+  def attemptId: Int = nextAttemptId
+
+  override def toString = "Stage " + id
+
+  override def hashCode(): Int = id
+
+  override def equals(other: Any): Boolean = other match {
+    case stage: Stage => stage != null && stage.id == id
+    case _ => false
+  }
+}
+
+private[spark] class ShuffleMapStage(
+    val id: Int,
+    val rdd: RDD[_],
+    val numTasks: Int,
+    val shuffleDep: ShuffleDependency[_, _, _],
+    val jobId: Int,
+    val callSite: CallSite)
+  extends Stage {
+
+  val outputLocs = Array.fill[List[MapStatus]](numPartitions)(Nil)
+  var numAvailableOutputs = 0
+  val jobSet = HashSet(jobId)
+
+  def isAvailable = numAvailableOutputs == numPartitions
 
   def addOutputLoc(partition: Int, status: MapStatus) {
     val prevList = outputLocs(partition)
@@ -123,22 +137,18 @@ private[spark] class Stage(
         this, execId, numAvailableOutputs, numPartitions, isAvailable))
     }
   }
+}
 
-  /** Return a new attempt id, starting with 0. */
-  def newAttemptId(): Int = {
-    val id = nextAttemptId
-    nextAttemptId += 1
-    id
-  }
+private[spark] class ResultStage(
+    val id: Int,
+    val rdd: RDD[_],
+    val numTasks: Int,
+    val parents: List[ShuffleMapStage],
+    val jobId: Int,
+    val callSite: CallSite)
+  extends Stage {
 
-  def attemptId: Int = nextAttemptId
+  var resultOfJob: Option[ActiveJob] = None
 
-  override def toString = "Stage " + id
-
-  override def hashCode(): Int = id
-
-  override def equals(other: Any): Boolean = other match {
-    case stage: Stage => stage != null && stage.id == id
-    case _ => false
-  }
+  def jobSet = Set(jobId)
 }
