@@ -180,11 +180,11 @@ case class GetArrayItem(child: Expression, ordinal: Expression)
     // TODO: consider using Array[_] for ArrayType child to avoid
     // boxing of primitives
     val baseValue = value.asInstanceOf[Seq[_]]
-    val index = ordinal.asInstanceOf[Int]
+    val index = ordinal.asInstanceOf[Number].longValue()
     if (index >= baseValue.size || index < 0) {
       null
     } else {
-      baseValue(index)
+      baseValue(index.asInstanceOf[Int])
     }
   }
 }

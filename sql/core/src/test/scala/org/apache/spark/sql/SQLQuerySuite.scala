@@ -1313,4 +1313,10 @@ class SQLQuerySuite extends QueryTest with BeforeAndAfterAll {
 
     checkAnswer(sql("SELECT a.`c.b`, `b.$q`[0].`a@!.q`, `q.w`.`w.i&`[0] FROM t"), Row(1, 1, 1))
   }
+
+  test("SPARK-7153: Long type ordinal in GetArrayItem") {
+    jsonRDD(sparkContext.makeRDD(
+      """{"a": [1, 2, 3], "b": 2}""" :: Nil)).registerTempTable("t")
+    checkAnswer(sql("SELECT a[b] FROM t"), Row(3))
+  }
 }
